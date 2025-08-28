@@ -11,6 +11,18 @@ from typing import Any, Dict, Optional, List, Tuple
 from flask import Flask, request, render_template_string, jsonify, Response
 import socket
 import sys
+import json, os
+
+def load_config():
+    try:
+        with open("config.json") as f:
+            return json.load(f)
+    except Exception:
+        return {"ip": "192.168.117.37", "port": "8080"}  # fallback default
+
+CONFIG = load_config()
+BASE_URL = f"http://{CONFIG['ip']}:{CONFIG['port']}"
+
 
 # =================== SETTINGS ===================
 # Primary model preference list (will try in order)
@@ -183,8 +195,7 @@ class VisionModule(BaseModule):
 
 # =================== AUDIO ===================
 class AudioModule(BaseModule):
-    def __init__(self, samplerate=SAMPLERATE, chunk=CHUNK,
-                 speak_rms_threshold=RMS_THRESHOLD, use_vad=USE_VAD):
+    def __init__(self, samplerate=SAMPLERATE, chunk=CHUNK, speak_rms_threshold=RMS_THRESHOLD, use_vad=USE_VAD):
         super().__init__("AudioModule")
         self.samplerate = samplerate
         self.chunk = chunk
@@ -193,8 +204,7 @@ class AudioModule(BaseModule):
         self._lock = threading.Lock()
         self._buffer = None
         self.use_vad = use_vad and VAD_OK
-        self.vad = webrtcvad.Vad(2) if self.use_vad else None
-        self.use_ipcam_audio = False   # NEW flag
+        self.vad = webrtcvad.Vad(2) if self.use_vad else None   # 0-3 (3 is aggressive)
 
     def start(self):
         try:
@@ -205,22 +215,23 @@ class AudioModule(BaseModule):
             self._stream.start()
             self.log(f"Audio stream started (VAD={'ON' if self.use_vad else 'OFF'})")
         except Exception as e:
-            # NEW: fallback flag if mic not available
-            self.use_ipcam_audio = True
-            self.log(f"Audio start failed: {e}. Using IP Webcam audio")
+            self.log(f"Audio start failed: {e}")
 
     def _callback(self, indata, frames, time_info, status):
-        if status:
+        if status:  # audio overflows/underflows warnings
             pass
         with self._lock:
             self._buffer = indata.copy()
 
     def _vad_is_speech(self, samples: np.ndarray) -> bool:
+        # WebRTC VAD expects 10/20/30 ms frames; use 30ms windows
+        # 30ms @16kHz = 480 samples
         if len(samples) < 480:
             return False
         try:
             pcm16 = samples.astype(np.int16).tobytes()
-            chunks = [pcm16[i:i+960] for i in range(0, min(len(pcm16), 960*3), 960)]
+            # We can check multiple 30ms chunks in the buffer for stability
+            chunks = [pcm16[i:i+960] for i in range(0, min(len(pcm16), 960*3), 960)]  # up to ~90ms
             for ch in chunks:
                 if len(ch) == 960 and self.vad.is_speech(ch, sample_rate=self.samplerate):
                     return True
@@ -229,11 +240,11 @@ class AudioModule(BaseModule):
             return False
 
     def run_once(self, context):
-        # NEW: if using IP Webcam, fetch fresh audio every loop
+        # 🔹 If using IP Webcam instead of sounddevice mic
         if self.use_ipcam_audio:
             import requests, io, soundfile as sf
             try:
-                r = requests.get("http://192.168.117.37:8080/audio.wav", stream=True, timeout=2)
+                r = requests.get(f"{BASE_URL}/audio.wav", stream=True, timeout=2)
                 data, samplerate = sf.read(io.BytesIO(r.content), dtype="int16")
                 with self._lock:
                     self._buffer = data.reshape(-1, 1)
@@ -248,6 +259,7 @@ class AudioModule(BaseModule):
             return None
 
         buf_int16 = buf.astype(np.int16).squeeze()
+        speaking = False
         rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
 
         if self.use_vad:
@@ -256,6 +268,7 @@ class AudioModule(BaseModule):
             speaking = rms > self.speak_rms_threshold
 
         return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
+
 
     def stop(self):
         try:
@@ -571,7 +584,7 @@ class UserInteractionModule(BaseModule):
 # =================== ORCHESTRATOR ===================
 class AICompanion:
     def __init__(self):
-        self.vision = VisionModule(camera_index="http://192.168.117.37:8080/video", show_window=SHOW_WINDOW)
+        self.vision = VisionModule(camera_index=f"{BASE_URL}/video", show_window=SHOW_WINDOW)
         self.audio = AudioModule()
         self.memory = MemoryModule()
         self.context = ContextModule()
