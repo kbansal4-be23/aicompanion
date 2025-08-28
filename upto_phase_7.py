@@ -11,18 +11,6 @@ from typing import Any, Dict, Optional, List, Tuple
 from flask import Flask, request, render_template_string, jsonify, Response
 import socket
 import sys
-import json, os
-
-def load_config():
-    try:
-        with open("config.json") as f:
-            return json.load(f)
-    except Exception:
-        return {"ip": "192.168.117.37", "port": "8080"}  # fallback default
-
-CONFIG = load_config()
-BASE_URL = f"http://{CONFIG['ip']}:{CONFIG['port']}"
-
 
 # =================== SETTINGS ===================
 # Primary model preference list (will try in order)
@@ -205,8 +193,6 @@ class AudioModule(BaseModule):
         self._buffer = None
         self.use_vad = use_vad and VAD_OK
         self.vad = webrtcvad.Vad(2) if self.use_vad else None   # 0-3 (3 is aggressive)
-        self.use_ipcam_audio = True   # 🔹 force audio from IP Webcam instead of device mic
-
 
     def start(self):
         try:
@@ -242,36 +228,22 @@ class AudioModule(BaseModule):
             return False
 
     def run_once(self, context):
-      if self.use_ipcam_audio:
-          import requests, io, soundfile as sf
-          try:
-              r = requests.get(f"{BASE_URL}/audio.wav", stream=True, timeout=2)
-              data, samplerate = sf.read(io.BytesIO(r.content), dtype="int16")
-              buf_int16 = data.astype(np.int16).squeeze()
-              rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
+        with self._lock:
+            buf = self._buffer
+            self._buffer = None
+        if buf is None:
+            return None
 
-              if self.use_vad:
-                  speaking = self._vad_is_speech(buf_int16)
-              else:
-                  speaking = rms > self.speak_rms_threshold
+        buf_int16 = buf.astype(np.int16).squeeze()
+        speaking = False
+        rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
 
-              return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
-          except Exception as e:
-              self.log(f"IPCam audio fetch failed: {e}")
-              return {"audio": {"ok": False, "reason": "no_audio"}}
+        if self.use_vad:
+            speaking = self._vad_is_speech(buf_int16)
+        else:
+            speaking = rms > self.speak_rms_threshold
 
-      # 🔹 fallback: sounddevice mic
-      with self._lock:
-          buf = self._buffer
-          self._buffer = None
-      if buf is None:
-          return None
-
-      buf_int16 = buf.astype(np.int16).squeeze()
-      rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
-      speaking = self._vad_is_speech(buf_int16) if self.use_vad else rms > self.speak_rms_threshold
-
-      return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
+        return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
 
     def stop(self):
         try:
@@ -587,7 +559,7 @@ class UserInteractionModule(BaseModule):
 # =================== ORCHESTRATOR ===================
 class AICompanion:
     def __init__(self):
-        self.vision = VisionModule(camera_index=f"{BASE_URL}/videofeed", show_window=SHOW_WINDOW)
+        self.vision = VisionModule(camera_index="http://192.168.117.37:8080/video", show_window=SHOW_WINDOW)
         self.audio = AudioModule()
         self.memory = MemoryModule()
         self.context = ContextModule()
