@@ -205,6 +205,8 @@ class AudioModule(BaseModule):
         self._buffer = None
         self.use_vad = use_vad and VAD_OK
         self.vad = webrtcvad.Vad(2) if self.use_vad else None   # 0-3 (3 is aggressive)
+        self.use_ipcam_audio = True   # 🔹 force audio from IP Webcam instead of device mic
+
 
     def start(self):
         try:
@@ -240,35 +242,36 @@ class AudioModule(BaseModule):
             return False
 
     def run_once(self, context):
-        # 🔹 If using IP Webcam instead of sounddevice mic
-        if self.use_ipcam_audio:
-            import requests, io, soundfile as sf
-            try:
-                r = requests.get(f"{BASE_URL}/audio.wav", stream=True, timeout=2)
-                data, samplerate = sf.read(io.BytesIO(r.content), dtype="int16")
-                with self._lock:
-                    self._buffer = data.reshape(-1, 1)
-            except Exception as e:
-                self.log(f"IPCam audio fetch failed: {e}")
-                return None
+      if self.use_ipcam_audio:
+          import requests, io, soundfile as sf
+          try:
+              r = requests.get(f"{BASE_URL}/audio.wav", stream=True, timeout=2)
+              data, samplerate = sf.read(io.BytesIO(r.content), dtype="int16")
+              buf_int16 = data.astype(np.int16).squeeze()
+              rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
 
-        with self._lock:
-            buf = self._buffer
-            self._buffer = None
-        if buf is None:
-            return None
+              if self.use_vad:
+                  speaking = self._vad_is_speech(buf_int16)
+              else:
+                  speaking = rms > self.speak_rms_threshold
 
-        buf_int16 = buf.astype(np.int16).squeeze()
-        speaking = False
-        rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
+              return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
+          except Exception as e:
+              self.log(f"IPCam audio fetch failed: {e}")
+              return {"audio": {"ok": False, "reason": "no_audio"}}
 
-        if self.use_vad:
-            speaking = self._vad_is_speech(buf_int16)
-        else:
-            speaking = rms > self.speak_rms_threshold
+      # 🔹 fallback: sounddevice mic
+      with self._lock:
+          buf = self._buffer
+          self._buffer = None
+      if buf is None:
+          return None
 
-        return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
+      buf_int16 = buf.astype(np.int16).squeeze()
+      rms = float(np.sqrt(np.mean(buf_int16.astype(np.float32) ** 2)))
+      speaking = self._vad_is_speech(buf_int16) if self.use_vad else rms > self.speak_rms_threshold
 
+      return {"audio": {"ok": True, "rms": rms, "speaking": bool(speaking), "vad": self.use_vad}}
 
     def stop(self):
         try:
@@ -584,7 +587,7 @@ class UserInteractionModule(BaseModule):
 # =================== ORCHESTRATOR ===================
 class AICompanion:
     def __init__(self):
-        self.vision = VisionModule(camera_index=f"{BASE_URL}/video", show_window=SHOW_WINDOW)
+        self.vision = VisionModule(camera_index=f"{BASE_URL}/videofeed", show_window=SHOW_WINDOW)
         self.audio = AudioModule()
         self.memory = MemoryModule()
         self.context = ContextModule()
