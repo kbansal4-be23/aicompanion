@@ -559,7 +559,7 @@ class UserInteractionModule(BaseModule):
 # =================== ORCHESTRATOR ===================
 class AICompanion:
     def __init__(self):
-        self.vision = VisionModule(camera_index="http://172.168.117.37:8080/video", show_window=SHOW_WINDOW)
+        self.vision = VisionModule(camera_index="http://192.168.117.37:8080/video", show_window=SHOW_WINDOW)
         self.audio = AudioModule()
         self.memory = MemoryModule()
         self.context = ContextModule()
